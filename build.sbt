@@ -14,4 +14,5 @@ libraryDependencies += "com.meetup" %% "archery" % "0.5.0-SNAPSHOT"
 
 libraryDependencies += "sh.den" %% "scala-offheap" % "0.1"
 
+libraryDependencies += "com.vividsolutions" % "jts" % "1.13"
 

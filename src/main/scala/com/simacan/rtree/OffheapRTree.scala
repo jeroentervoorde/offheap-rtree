@@ -1,48 +1,67 @@
 package com.simacan.rtree
 
 import archery._
+import com.vividsolutions.jts.geom.Coordinate
 
 import scala.offheap._
-import scala.offheap.{EmbedArray, data}
+import scala.offheap.{ EmbedArray, data }
 
 object OffheapRTree {
 
-  @data class OHBox(var minX: Float, var minY: Float, var maxX: Float, var maxY: Float) {
+  val FixedPointCoordinateMultiplier = 1000000
+
+  @data class OHBox(var minX: Int, var minY: Int, var maxX: Int, var maxY: Int) {
     def intersects(geom: Box): Boolean =
       minX <= geom.x2 && geom.x <= maxX && minY <= geom.y2 && geom.y <= maxY
 
   }
 
-  @data class OHCoord(var x: Float,  var y: Float)
+  @data class OHCoord(var x: Short, var y: Short)
 
   //@data class OHNode(var nodeType: Byte, var numChildren: Int, val box: OHBox)
 
-  private[this] val BranchNode : Byte = 1
-  private[this] val LeafNode : Byte = 2
+  private[this] val BranchNode: Byte = 1
+  private[this] val LeafNode: Byte = 2
 
-  private[this] def sizeOfEntry(e: Entry[Int]) : Long = {
+  private[this] def sizeOfEntry(e: Entry[Int]): Long = {
     val g = e.geom match {
       case ls: LineString =>
-        sizeOf[Int] + ls.coords.size * sizeOfEmbed[OHCoord]
+        sizeOf[Short] + sizeOf[Short] + ls.coords.size * sizeOfEmbed[OHCoord] // box offset, num coords, coords
     }
 
-    sizeOf[Int] + g
+    sizeOf[Int] + g // value + geom
   }
 
-  private[this] def entryToOffheap(atAddr: Long, e: Entry[Int]) : Unit = {
+  private[this] def entryToOffheap(atAddr: Long, e: Entry[Int], boxAddr: Addr): Unit = {
     var addr = atAddr
     Memory.putInt(addr, e.value)
     addr += sizeOf[Int]
 
     e.geom match {
       case ls: LineString =>
-        Memory.putInt(addr, ls.coords.size)
-        addr += sizeOf[Int]
+        Memory.putShort(addr, ls.coords.size.toShort)
+        addr += sizeOf[Short]
+
+        if (atAddr - boxAddr > Short.MaxValue) {
+          throw new RuntimeException(s"Cannot address box position (${atAddr - boxAddr} > ${Short.MaxValue})")
+        }
+
+        Memory.putShort(addr, (atAddr - boxAddr).toShort)
+        addr += sizeOf[Short]
+
+        val leafBox: OHBox = OHBox.fromAddr(boxAddr)
+
+        val dx = leafBox.maxX - leafBox.minX
+        val dy = leafBox.maxY - leafBox.minY
 
         ls.coords.foreach { c =>
-          val ohCoord : OHCoord = OHCoord.fromAddr(addr)
-          ohCoord.x = c.x
-          ohCoord.y = c.y
+
+          val x: Short = (((c.x.toDouble * FixedPointCoordinateMultiplier - leafBox.minX) / dx) * Short.MaxValue).toShort
+          val y: Short = (((c.y.toDouble * FixedPointCoordinateMultiplier - leafBox.minY) / dy) * Short.MaxValue).toShort
+
+          val ohCoord: OHCoord = OHCoord.fromAddr(addr)
+          ohCoord.x = x
+          ohCoord.y = y
           addr += sizeOfEmbed[OHCoord]
         }
     }
@@ -51,13 +70,13 @@ object OffheapRTree {
   private[this] def sizeOfNode(n: Node[Int]): Long = {
     n match {
       case b: Branch[Int] =>
-        sizeOf[Byte] + sizeOf[Int] + sizeOfEmbed[OHBox] + b.children.map(c => sizeOf[Int] + sizeOfNode(c)).sum
+        sizeOf[Byte] + sizeOf[Byte] + sizeOfEmbed[OHBox] + b.children.map(c => sizeOf[Int] + sizeOfNode(c)).sum
       case l: Leaf[Int] =>
-        sizeOf[Byte] + sizeOf[Int] + sizeOfEmbed[OHBox] + l.children.map(sizeOfEntry).sum
+        sizeOf[Byte] + sizeOf[Byte] + sizeOfEmbed[OHBox] + l.children.map(sizeOfEntry).sum
     }
   }
 
-  private[this] def nodeToOffheap(atAddr: Long, n: Node[Int]) : Seq[(Int, Addr)] = {
+  private[this] def nodeToOffheap(atAddr: Long, n: Node[Int]): Iterator[(Int, Addr)] = {
     var addr = atAddr
 
     val nodeType = n match {
@@ -68,26 +87,27 @@ object OffheapRTree {
     Memory.putByte(addr, nodeType)
     addr += sizeOf[Byte]
 
-    Memory.putInt(addr, n.children.size)
-    addr += sizeOf[Int]
+    Memory.putByte(addr, n.children.size.toByte)
+    addr += sizeOf[Byte]
 
-    val box : OHBox = OHBox.fromAddr(addr)
-    box.minX = n.box.x
-    box.minY = n.box.y
-    box.maxX = n.box.x2
-    box.maxY = n.box.y2
+    val boxAddr = addr
+    val box: OHBox = OHBox.fromAddr(boxAddr)
+    box.minX = (n.box.x.toDouble * FixedPointCoordinateMultiplier).floor.toInt
+    box.minY = (n.box.y.toDouble * FixedPointCoordinateMultiplier).floor.toInt
+    box.maxX = (n.box.x2.toDouble * FixedPointCoordinateMultiplier).ceil.toInt
+    box.maxY = (n.box.y2.toDouble * FixedPointCoordinateMultiplier).ceil.toInt
     addr += sizeOfEmbed[OHBox]
 
     n match {
-      case b: Branch[Int] => branchToOffheap(addr, b)
-      case l: Leaf[Int] => leafToOffheap(addr, l)
+      case b: Branch[Int] => branchToOffheap(atAddr, addr, b)
+      case l: Leaf[Int] => leafToOffheap(atAddr, addr, l, boxAddr)
     }
   }
 
-  private[this] def branchToOffheap(atAddr: Addr, b: Branch[Int]) : Seq[(Int, Addr)] = {
+  private[this] def branchToOffheap(nodeAddr: Long, atAddr: Addr, b: Branch[Int]): Iterator[(Int, Addr)] = {
     var addr = atAddr
 
-    b.children.flatMap { c =>
+    val childIterators = b.children.map { c =>
       val size = sizeOfNode(c).toInt
       Memory.putInt(addr, size)
       addr += sizeOf[Int]
@@ -97,20 +117,23 @@ object OffheapRTree {
 
       entries
     }
+
+    childIterators.iterator.flatten
   }
 
-  private[this] def leafToOffheap(atAddr: Addr, l: Leaf[Int]) : Seq[(Int, Addr)] = {
+  private[this] def leafToOffheap(nodeAddr: Long, atAddr: Addr, l: Leaf[Int], boxAddr: Addr): Iterator[(Int, Addr)] = {
     var addr = atAddr
 
-    l.entries.map { c =>
-      entryToOffheap(addr, c)
+    l.entries.foreach { c =>
+      entryToOffheap(addr, c, boxAddr)
       addr += sizeOfEntry(c)
-
-      (c.value, addr)
     }
+
+    // Iterate over the values we just created.
+    leafChildrenIterator(nodeAddr).map(tup => (tup._2, tup._1))
   }
 
-  def writeOffheap(tree: RTree[Int]) : (Addr, Long, Seq[(Int, Addr)]) = {
+  def writeOffheap(tree: RTree[Int]): (Addr, Long, Iterator[(Int, Addr)]) = {
 
     val size = sizeOfNode(tree.root)
     val addr = malloc.allocate(size)
@@ -118,94 +141,196 @@ object OffheapRTree {
     (addr, size, entries)
   }
 
-  def search(atAddr: Addr, space: Box) : Iterator[Int] = {
+  def search(atAddr: Addr, space: Box): Iterator[Int] = {
+
+    val spaceFixed = Box(
+      space.x * FixedPointCoordinateMultiplier.floor,
+      space.y * FixedPointCoordinateMultiplier.floor,
+      space.x2 * FixedPointCoordinateMultiplier.ceil,
+      space.y2 * FixedPointCoordinateMultiplier.ceil
+    )
+
+    doSearch(atAddr, spaceFixed)
+  }
+
+  private[this] def doSearch(atAddr: Addr, space: Box): Iterator[Int] = {
 
     var addr = atAddr
     val nodeType = Memory.getByte(addr)
     addr += sizeOf[Byte]
 
-    val numChildren = Memory.getInt(addr)
-    addr += sizeOf[Int]
+    val numChildren = Memory.getByte(addr)
+    addr += sizeOf[Byte]
 
-    val ohBox : OHBox = OHBox.fromAddr(addr)
+    val ohBox: OHBox = OHBox.fromAddr(addr)
     addr += sizeOfEmbed[OHBox]
 
-    val box = Box(ohBox.minX, ohBox.minY, ohBox.maxX, ohBox.maxY)
-
-    if (numChildren == 0 || !box.intersects(space)) {
+    if (numChildren == 0 || !ohBox.intersects(space)) {
       Iterator.empty
     } else {
       nodeType match {
         case LeafNode =>
-          val children = new Iterator[(Int, Box)] {
-
-            var index = 0
-
-            override def hasNext(): Boolean = {
-              index < numChildren
-            }
-
-            override def next(): (Int, Box) = {
-              val value = Memory.getInt(addr)
-              addr += sizeOf[Int]
-
-              val numCoords = Memory.getInt(addr)
-              addr += sizeOf[Int]
-
-              var minX = Float.MaxValue
-              var minY = Float.MaxValue
-              var maxX = Float.MinValue
-              var maxY = Float.MinValue
-
-              var coordAddr = addr
-              var coordIdx = 0
-              while(coordIdx < numCoords) {
-                val coord : OHCoord = OHCoord.fromAddr(addr)
-                addr += sizeOfEmbed[OHCoord]
-
-                minX = math.min(minX, coord.x)
-                maxX = math.max(maxX, coord.x)
-                minY = math.min(minY, coord.y)
-                maxY = math.max(maxY, coord.y)
-
-                coordIdx += 1
-              }
-
-              val entryBox = Box(minX, minY, maxX, maxY)
-
-              index += 1
-              (value, entryBox)
-            }
-          }
-
-          children.filter(item => space.intersects(item._2)).map(_._1)
+          val children = leafChildrenIterator(atAddr)
+          children.filter { item =>
+            space.intersects(item._3)
+          } .map(_._2)
 
         case BranchNode =>
-
-          val children = new Iterator[(Addr, OHBox)] {
-            var index = 0
-
-            override def hasNext(): Boolean = {
-              index < numChildren
-            }
-
-            override def next(): (Addr, OHBox) = {
-              val size = Memory.getInt(addr)
-              addr += sizeOf[Int]
-
-              val boxAddr = addr + sizeOf[Byte] + sizeOf[Int] // Skip type byte and numChildren
-              val ohBox : OHBox = OHBox.fromAddr(boxAddr)
-
-              val result = (addr, ohBox)
-
-              addr += size
-              index += 1
-
-              result
-            }
+          val children = branchChildrenIteraor(atAddr)
+          children.filter { item =>
+            item._2.intersects(space)
+          }.flatMap { item =>
+            doSearch(item._1, space)
           }
+      }
+    }
+  }
 
-          children.filter(item => item._2.intersects(space)).flatMap(item => search(item._1, space))
+  def coordinatesForEntry(entryAddr: Addr): Iterator[Coordinate] = {
+    var addr = entryAddr
+
+    addr += sizeOf[Int] // Skip value
+
+    val numCoords = Memory.getShort(addr)
+    addr += sizeOf[Short]
+
+    val boxAddr = entryAddr - Memory.getShort(addr)
+    addr += sizeOf[Short]
+
+    val leafBox: OHBox = OHBox.fromAddr(boxAddr)
+
+    var coordAddr = addr
+    var coordIdx = 0
+
+    new Iterator[Coordinate] {
+      override def hasNext: Boolean = coordIdx < numCoords
+
+      override def next(): Coordinate = {
+
+        val coord: OHCoord = OHCoord.fromAddr(addr)
+        addr += sizeOfEmbed[OHCoord]
+
+        val x = (leafBox.minX + (leafBox.maxX - leafBox.minX).toDouble * (coord.x.toDouble / Short.MaxValue)) / FixedPointCoordinateMultiplier
+        val y = (leafBox.minY + (leafBox.maxY - leafBox.minY).toDouble * (coord.y.toDouble / Short.MaxValue)) / FixedPointCoordinateMultiplier
+
+        val result = new Coordinate(x, y)
+
+        coordIdx += 1
+
+        result
+      }
+    }
+  }
+
+  def coordinateAt(entryAddr: Addr, coordIdx: Int): Coordinate = {
+    var addr = entryAddr
+
+    addr += sizeOf[Int] // Skip value
+    addr += sizeOf[Short] // Skip numcoords
+
+    val boxAddr = entryAddr - Memory.getShort(addr)
+    addr += sizeOf[Short]
+
+    val leafBox: OHBox = OHBox.fromAddr(boxAddr)
+    val coord: OHCoord = OHCoord.fromAddr(addr + (coordIdx * sizeOfEmbed[OHCoord]))
+
+    val x = (leafBox.minX + (leafBox.maxX - leafBox.minX).toDouble * (coord.x.toDouble / Short.MaxValue)) / FixedPointCoordinateMultiplier
+    val y = (leafBox.minY + (leafBox.maxY - leafBox.minY).toDouble * (coord.y.toDouble / Short.MaxValue)) / FixedPointCoordinateMultiplier
+
+    new Coordinate(x, y)
+  }
+
+  def numCoordinates(entryAddr: Addr): Short = Memory.getShort(entryAddr + sizeOf[Int])
+
+  private[this] def leafChildrenIterator(leafAddr: Addr) = {
+    var addr = leafAddr + 1 // Skip node type
+
+    val numChildren = Memory.getByte(addr)
+    addr += sizeOf[Byte]
+
+    val leafBox = OHBox.fromAddr(addr)
+    addr += sizeOfEmbed[OHBox] // Skip leaf box
+
+    new Iterator[(Addr, Int, Box)] {
+
+      var index = 0
+
+      override def hasNext(): Boolean = {
+        index < numChildren
+      }
+
+      override def next(): (Addr, Int, Box) = {
+        val childAddr = addr
+
+        val value = Memory.getInt(addr)
+        addr += sizeOf[Int]
+
+        val numCoords = Memory.getShort(addr)
+        addr += sizeOf[Short]
+
+        addr += sizeOf[Short] // Skip box offset
+
+        var minX = Float.MaxValue
+        var minY = Float.MaxValue
+        var maxX = Float.MinValue
+        var maxY = Float.MinValue
+
+        var coordAddr = addr
+        var coordIdx = 0
+        while (coordIdx < numCoords) {
+          val coord: OHCoord = OHCoord.fromAddr(addr)
+          addr += sizeOfEmbed[OHCoord]
+
+          val xc = leafBox.minX + (leafBox.maxX - leafBox.minX).toDouble * (coord.x.toDouble / Short.MaxValue)
+          val yc = leafBox.minY + (leafBox.maxY - leafBox.minY).toDouble * (coord.y.toDouble / Short.MaxValue)
+
+          val x = math.max(math.min(xc, leafBox.maxX), leafBox.minX)
+          val y = math.max(math.min(yc, leafBox.maxY), leafBox.minY)
+
+          minX = math.min(minX, x.toFloat)
+          maxX = math.max(maxX, x.toFloat)
+          minY = math.min(minY, y.toFloat)
+          maxY = math.max(maxY, y.toFloat)
+
+          coordIdx += 1
+        }
+
+        val entryBox = Box(minX, minY, maxX, maxY)
+
+        index += 1
+        (childAddr, value, entryBox)
+      }
+    }
+  }
+
+  private[this] def branchChildrenIteraor(branchAddr: Addr) = {
+    var addr = branchAddr + 1 // Skip node type
+
+    val numChildren = Memory.getByte(addr)
+    addr += sizeOf[Byte]
+
+    addr += sizeOfEmbed[OHBox]  // Skip leaf box.
+
+    new Iterator[(Addr, OHBox)] {
+      var index = 0
+
+      override def hasNext(): Boolean = {
+        index < numChildren
+      }
+
+      override def next(): (Addr, OHBox) = {
+        val size = Memory.getInt(addr)
+        addr += sizeOf[Int]
+
+        val boxAddr = addr + sizeOf[Byte] + sizeOf[Byte] // Skip type byte and numChildren
+        val ohBox: OHBox = OHBox.fromAddr(boxAddr)
+
+        val result = (addr, ohBox)
+
+        addr += size
+        index += 1
+
+        result
       }
     }
   }

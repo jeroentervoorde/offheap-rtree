@@ -27,9 +27,10 @@ object Test {
 
     val (addr, size, entries) = OffheapRTree.writeOffheap(tree)
 
-    println(size)
-    println(entries)
+    entries.foreach { e =>
+      println(OffheapRTree.coordinatesForEntry(e._2).toList)
+    }
 
-    println(OffheapRTree.search(addr, Box(6, 1, 10, 10)).toList)
+    println(OffheapRTree.search(addr, Box(5.9f, 0.9f, 10, 10)).toList)
   }
 }
