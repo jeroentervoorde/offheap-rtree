@@ -1,6 +1,7 @@
 package com.simacan.rtree
 
 import archery._
+import com.simacan.rtree.OffheapRTree.OffheapEntry
 
 object Test {
   def main(args: Array[String]): Unit = {
@@ -27,10 +28,13 @@ object Test {
 
     val (addr, size, entries) = OffheapRTree.writeOffheap(tree)
 
+    println("hier")
+
     entries.foreach { e =>
-      println(OffheapRTree.coordinatesForEntry(e._2).toList)
+      println(new OffheapEntry(e._2).coordinatesForEntry.toList)
     }
 
+    println("hier niet")
     println(OffheapRTree.search(addr, Box(5.9f, 0.9f, 10, 10)).toList)
   }
 }
