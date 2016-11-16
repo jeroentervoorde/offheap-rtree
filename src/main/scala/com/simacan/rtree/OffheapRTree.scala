@@ -9,33 +9,29 @@ import scala.offheap.{ EmbedArray, data }
 object OffheapRTree {
 
   val FixedPointCoordinateMultiplier = 1000000
+  private[this] val BranchNode: Byte = 1
+  private[this] val LeafNode: Byte = 2
 
   @data class OHBox(var minX: Int, var minY: Int, var maxX: Int, var maxY: Int) {
     def intersects(geom: Box): Boolean =
       minX <= geom.x2 && geom.x <= maxX && minY <= geom.y2 && geom.y <= maxY
-
   }
 
   @data class OHCoord(var x: Short, var y: Short)
 
-  /**
-    * Created by jeroen on 11/16/16.
-    */
   trait OffheapNode extends Any {
     val nodeAddr: Addr
 
-    def headerSize: Long = sizeOf[Byte] + sizeOf[Byte] + sizeOfEmbed[OHBox]
+    private[rtree] def headerSize: Long = sizeOf[Byte] + sizeOf[Byte] + sizeOfEmbed[OHBox]
+    private[rtree] def nodeBoxAddr: Addr = nodeAddr + sizeOf[Byte] + sizeOf[Byte]
 
     def nodeType: Byte = Memory.getByte(nodeAddr)
-
     def nodeNumChildren = Memory.getByte(nodeAddr + sizeOf[Byte])
-
-    def nodeBoxAddr: Addr = nodeAddr + sizeOf[Byte] + sizeOf[Byte]
     def nodeBox: OHBox = OHBox.fromAddr(nodeBoxAddr)
 
     def search(space: Box): Iterator[OffheapEntry]
 
-    def write(n: Node[Int]): Iterator[(Int, Addr)] = {
+    def write(n: Node[Int]): Iterator[OffheapEntry] = {
 
       n match {
         case l: Leaf[Int] => new OffheapLeaf(nodeAddr).write(l)
@@ -71,7 +67,7 @@ object OffheapRTree {
 
   object OffheapNode {
 
-    def writeTo(addr: Addr, n: Node[Int]) : Iterator[(Int,Addr)] = {
+    def writeTo(addr: Addr, n: Node[Int]) : Iterator[OffheapEntry] = {
       val node = n match {
         case l: Leaf[Int] => new OffheapLeaf(addr)
         case b: Branch[Int] => new OffheapBranch(addr)
@@ -92,70 +88,30 @@ object OffheapRTree {
   class OffheapLeaf(val nodeAddr: Addr) extends AnyVal with OffheapNode {
 
     override def search(space: Box): Iterator[OffheapEntry] = {
-      children.filter { item =>
-        space.intersects(item._3)
-      } .map( e => new OffheapEntry(e._1) )
+      children.filter(item => space.intersects(item.box))
     }
 
-    def children: Iterator[(Addr, Int, Box)] = {
+    def children: Iterator[OffheapEntry] = {
       val numChildren = nodeNumChildren
 
-      val leafBox = nodeBox
-
-      var addr = nodeAddr + headerSize
-      new Iterator[(Addr, Int, Box)] {
-
+      new Iterator[OffheapEntry] {
+        var addr = nodeAddr + headerSize
         var index = 0
 
         override def hasNext(): Boolean = {
           index < numChildren
         }
 
-        override def next(): (Addr, Int, Box) = {
-          val childAddr = addr
-
-          val value = Memory.getInt(addr)
-          addr += sizeOf[Int]
-
-          val numCoords = Memory.getShort(addr)
-          addr += sizeOf[Short]
-
-          addr += sizeOf[Short] // Skip box offset
-
-          var minX = Float.MaxValue
-          var minY = Float.MaxValue
-          var maxX = Float.MinValue
-          var maxY = Float.MinValue
-
-          var coordAddr = addr
-          var coordIdx = 0
-          while (coordIdx < numCoords) {
-            val coord: OHCoord = OHCoord.fromAddr(addr)
-            addr += sizeOfEmbed[OHCoord]
-
-            val xc = leafBox.minX + (leafBox.maxX - leafBox.minX).toDouble * (coord.x.toDouble / Short.MaxValue)
-            val yc = leafBox.minY + (leafBox.maxY - leafBox.minY).toDouble * (coord.y.toDouble / Short.MaxValue)
-
-            val x = math.max(math.min(xc, leafBox.maxX), leafBox.minX)
-            val y = math.max(math.min(yc, leafBox.maxY), leafBox.minY)
-
-            minX = math.min(minX, x.toFloat)
-            maxX = math.max(maxX, x.toFloat)
-            minY = math.min(minY, y.toFloat)
-            maxY = math.max(maxY, y.toFloat)
-
-            coordIdx += 1
-          }
-
-          val entryBox = Box(minX, minY, maxX, maxY)
-
+        override def next(): OffheapEntry = {
           index += 1
-          (childAddr, value, entryBox)
+          val entry = new OffheapEntry(addr)
+          addr += entry.sizeInBytes
+          entry
         }
       }
     }
 
-    def write(l: Leaf[Int]): Iterator[(Int, Addr)] = {
+    private[rtree] def write(l: Leaf[Int]): Iterator[OffheapEntry] = {
       var addr = writeNodeHeader(l)
 
       l.entries.foreach { c =>
@@ -164,43 +120,34 @@ object OffheapRTree {
       }
 
       // Iterate over the values we just created.
-      children.map(tup => (tup._2, tup._1))
+      children
     }
   }
 
   class OffheapBranch(val nodeAddr: Addr) extends AnyVal with OffheapNode {
 
     override def search(space: Box): Iterator[OffheapEntry] = {
-      children.filter { item =>
-        item._2.intersects(space)
-      }.flatMap { item =>
-        OffheapNode.fromAddr(item._1).search(space)
-      }
+      children.filter(_.nodeBox.intersects(space)).flatMap(_.search(space))
     }
 
-    def children: Iterator[(Addr, OHBox)] = {
-      var addr = nodeAddr + 1 // Skip node type
+    def children: Iterator[OffheapNode] = {
+      var addr = nodeAddr + headerSize
 
-      val numChildren = Memory.getByte(addr)
-      addr += sizeOf[Byte]
+      val numChildren = nodeNumChildren
 
-      addr += sizeOfEmbed[OHBox]  // Skip leaf box.
-
-      new Iterator[(Addr, OHBox)] {
+      new Iterator[OffheapNode] {
         var index = 0
 
         override def hasNext(): Boolean = {
           index < numChildren
         }
 
-        override def next(): (Addr, OHBox) = {
+        override def next(): OffheapNode = {
           val size = Memory.getInt(addr)
           addr += sizeOf[Int]
 
-          val boxAddr = addr + sizeOf[Byte] + sizeOf[Byte] // Skip type byte and numChildren
-          val ohBox: OHBox = OHBox.fromAddr(boxAddr)
-
-          val result = (addr, ohBox)
+          val node = OffheapNode.fromAddr(addr)
+          val result = node
 
           addr += size
           index += 1
@@ -210,7 +157,7 @@ object OffheapRTree {
       }
     }
 
-    def write(b: Branch[Int]): Iterator[(Int, Addr)] = {
+    private[rtree] def write(b: Branch[Int]): Iterator[OffheapEntry] = {
       var addr = writeNodeHeader(b)
 
       val childIterators = b.children.map { c =>
@@ -230,26 +177,69 @@ object OffheapRTree {
 
   class OffheapEntry(val entryAddr: Addr) extends AnyVal {
 
+    private[rtree] def sizeInBytes = entryHeaderSize + numCoordinates * sizeOfEmbed[OHCoord]
+    private[this] def leafBoxOffset: Short = Memory.getShort(entryAddr + sizeOf[Int] + sizeOf[Short])
+    private[rtree] def leafBoxInst : OHBox = OHBox.fromAddr(entryAddr - leafBoxOffset)
+    private[rtree] def entryHeaderSize : Long = sizeOf[Int] + sizeOf[Short] + sizeOf[Short]
+
     def value: Int = Memory.getInt(entryAddr)
 
     def numCoordinates: Short = Memory.getShort(entryAddr + sizeOf[Int])
 
-    def leafBoxOffset: Short = Memory.getShort(entryAddr + sizeOf[Int] + sizeOf[Short])
+    def box : Box = {
+      val leafBox = leafBoxInst
+      val numCoords = numCoordinates
 
-    def leafBoxInst : OHBox = OHBox.fromAddr(entryAddr - leafBoxOffset)
+      var minX = Float.MaxValue
+      var minY = Float.MaxValue
+      var maxX = Float.MinValue
+      var maxY = Float.MinValue
 
-    def entryHeaderSize : Long = sizeOf[Int] + sizeOf[Short] + sizeOf[Short]
+      //var coordAddr = addr + entry.entryHeaderSize
+      var coordIdx = 0
+      while (coordIdx < numCoords) {
+        val coord: OHCoord = relativeCoordAt(coordIdx)
 
+        val x = convertXFromRelativeToFixed(leafBox, coord.x)
+        val y = convertYFromRelativeToFixed(leafBox, coord.y)
+
+        minX = math.min(minX, x.toFloat)
+        maxX = math.max(maxX, x.toFloat)
+        minY = math.min(minY, y.toFloat)
+        maxY = math.max(maxY, y.toFloat)
+
+        coordIdx += 1
+      }
+
+      val minXcapped = math.max(minX, leafBox.minX)  // Make sure x,y are in the box
+      val minYcapped = math.max(minY, leafBox.minY)
+      val maxXcapped = math.min(maxX, leafBox.maxX)  // Make sure x,y are in the box
+      val maxYcapped = math.min(maxY, leafBox.maxY)
+
+      Box(minXcapped, minYcapped, maxXcapped, maxYcapped)
+    }
+
+    // Coordinate at index
+    def coordinateAt(coordIdx: Int): Coordinate = {
+      val addr = entryAddr + entryHeaderSize
+
+      val leafBox: OHBox = leafBoxInst
+      val coord: OHCoord = OHCoord.fromAddr(addr + (coordIdx * sizeOfEmbed[OHCoord]))
+
+      convertEntryCoordinate(leafBox, coord)
+    }
+
+    // Iterate over all coordinates
     def coordinatesForEntry: Iterator[Coordinate] = {
       var addr = entryAddr + entryHeaderSize
 
       val leafBox: OHBox = leafBoxInst
       val numCoords = numCoordinates
 
-      var coordAddr = addr
-      var coordIdx = 0
-
       new Iterator[Coordinate] {
+        private[this] var coordAddr = addr
+        private[this] var coordIdx = 0
+
         override def hasNext: Boolean = coordIdx < numCoords
 
         override def next(): Coordinate = {
@@ -257,31 +247,18 @@ object OffheapRTree {
           val coord: OHCoord = OHCoord.fromAddr(addr)
           addr += sizeOfEmbed[OHCoord]
 
-          val x = (leafBox.minX + (leafBox.maxX - leafBox.minX).toDouble * (coord.x.toDouble / Short.MaxValue)) / FixedPointCoordinateMultiplier
-          val y = (leafBox.minY + (leafBox.maxY - leafBox.minY).toDouble * (coord.y.toDouble / Short.MaxValue)) / FixedPointCoordinateMultiplier
-
-          val result = new Coordinate(x, y)
-
           coordIdx += 1
-
-          result
+          convertEntryCoordinate(leafBox, coord)
         }
       }
     }
 
-    def coordinateAt(coordIdx: Int): Coordinate = {
-      val addr = entryAddr + entryHeaderSize
-
-      val leafBox: OHBox = leafBoxInst
-      val coord: OHCoord = OHCoord.fromAddr(addr + (coordIdx * sizeOfEmbed[OHCoord]))
-
-      val x = (leafBox.minX + (leafBox.maxX - leafBox.minX).toDouble * (coord.x.toDouble / Short.MaxValue)) / FixedPointCoordinateMultiplier
-      val y = (leafBox.minY + (leafBox.maxY - leafBox.minY).toDouble * (coord.y.toDouble / Short.MaxValue)) / FixedPointCoordinateMultiplier
-
-      new Coordinate(x, y)
+    private[rtree] def relativeCoordAt(coordIdx: Int): OHCoord = {
+      val addr = entryAddr + entryHeaderSize + coordIdx * sizeOfEmbed[OHCoord]
+      OHCoord.fromAddr(addr)
     }
 
-    def write(e: Entry[Int], boxAddr: Addr): Unit = {
+    private[rtree] def write(e: Entry[Int], boxAddr: Addr): Unit = {
       var addr = entryAddr
       Memory.putInt(addr, e.value)
       addr += sizeOf[Int]
@@ -300,13 +277,9 @@ object OffheapRTree {
 
           val leafBox: OHBox = OHBox.fromAddr(boxAddr)
 
-          val dx = leafBox.maxX - leafBox.minX
-          val dy = leafBox.maxY - leafBox.minY
-
           ls.coords.foreach { c =>
-
-            val x: Short = (((c.x.toDouble * FixedPointCoordinateMultiplier - leafBox.minX) / dx) * Short.MaxValue).toShort
-            val y: Short = (((c.y.toDouble * FixedPointCoordinateMultiplier - leafBox.minY) / dy) * Short.MaxValue).toShort
+            val x: Short = convertXToRelative(leafBox, c.x)
+            val y: Short = convertYToRelative(leafBox, c.y)
 
             val ohCoord: OHCoord = OHCoord.fromAddr(addr)
             ohCoord.x = x
@@ -316,33 +289,36 @@ object OffheapRTree {
       }
     }
 
+    @inline private[rtree] def convertXToRelative(leafBox: OHBox, x: Float) : Short = {
+      val dx = leafBox.maxX - leafBox.minX
+      (((x.toDouble * FixedPointCoordinateMultiplier - leafBox.minX) / dx) * Short.MaxValue).toShort
+    }
+
+    @inline private[rtree] def convertYToRelative(leafBox: OHBox, y: Float) : Short = {
+      val dy = leafBox.maxY - leafBox.minY
+      (((y.toDouble * FixedPointCoordinateMultiplier - leafBox.minY) / dy) * Short.MaxValue).toShort
+    }
+
+    @inline private[rtree] def convertXFromRelativeToFixed(leafBox: OHBox, x: Short) : Int = {
+      (leafBox.minX + (leafBox.maxX - leafBox.minX).toDouble * (x.toDouble / Short.MaxValue)).toInt
+    }
+
+    @inline private[rtree] def convertYFromRelativeToFixed(leafBox: OHBox, y: Short) : Int = {
+      (leafBox.minY + (leafBox.maxY - leafBox.minY).toDouble * (y.toDouble / Short.MaxValue)).toInt
+    }
+
+    @inline private[rtree] def convertEntryCoordinate(leafBox: OHBox, coord: OHCoord) : Coordinate = {
+      val x = convertXFromRelativeToFixed(leafBox, coord.x).toDouble / FixedPointCoordinateMultiplier
+      val y = convertYFromRelativeToFixed(leafBox, coord.y).toDouble / FixedPointCoordinateMultiplier
+      new Coordinate(x, y)
+    }
+
     override def toString = {
       value + "@" + entryAddr
     }
   }
 
-  private[this] val BranchNode: Byte = 1
-  private[this] val LeafNode: Byte = 2
-
-  private[this] def sizeOfEntry(e: Entry[Int]): Long = {
-    val g = e.geom match {
-      case ls: LineString =>
-        sizeOf[Short] + sizeOf[Short] + ls.coords.size * sizeOfEmbed[OHCoord] // box offset, num coords, coords
-    }
-
-    sizeOf[Int] + g // value + geom
-  }
-
-  private[this] def sizeOfNode(n: Node[Int]): Long = {
-    n match {
-      case b: Branch[Int] =>
-        sizeOf[Byte] + sizeOf[Byte] + sizeOfEmbed[OHBox] + b.children.map(c => sizeOf[Int] + sizeOfNode(c)).sum
-      case l: Leaf[Int] =>
-        sizeOf[Byte] + sizeOf[Byte] + sizeOfEmbed[OHBox] + l.children.map(sizeOfEntry).sum
-    }
-  }
-
-  def writeOffheap(tree: RTree[Int]): (Addr, Long, Iterator[(Int, Addr)]) = {
+  def writeOffheap(tree: RTree[Int]): (Addr, Long, Iterator[OffheapEntry]) = {
 
     val size = sizeOfNode(tree.root)
     val addr = malloc.allocate(size)
@@ -360,5 +336,23 @@ object OffheapRTree {
     )
 
     OffheapNode.fromAddr(atAddr).search(spaceFixed)
+  }
+
+  private[this] def sizeOfEntry(e: Entry[Int]): Long = {
+    val g = e.geom match {
+      case ls: LineString =>
+        sizeOf[Short] + sizeOf[Short] + ls.coords.size * sizeOfEmbed[OHCoord] // box offset, num coords, coords
+    }
+
+    sizeOf[Int] + g // value + geom
+  }
+
+  private[this] def sizeOfNode(n: Node[Int]): Long = {
+    n match {
+      case b: Branch[Int] =>
+        sizeOf[Byte] + sizeOf[Byte] + sizeOfEmbed[OHBox] + b.children.map(c => sizeOf[Int] + sizeOfNode(c)).sum
+      case l: Leaf[Int] =>
+        sizeOf[Byte] + sizeOf[Byte] + sizeOfEmbed[OHBox] + l.children.map(sizeOfEntry).sum
+    }
   }
 }

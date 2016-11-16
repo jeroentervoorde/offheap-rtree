@@ -31,7 +31,7 @@ object Test {
     println("hier")
 
     entries.foreach { e =>
-      println(new OffheapEntry(e._2).coordinatesForEntry.toList)
+      println(e.coordinatesForEntry.toList)
     }
 
     println("hier niet")
